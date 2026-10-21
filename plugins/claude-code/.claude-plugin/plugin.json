@@ -1,6 +1,6 @@
 {
   "name": "bos-memory",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "description": "BOS Memory for Claude Code: the memory tools, what memory knows at the start of each session, and automatic capture of decisions, commitments and rules from your sessions.",
   "author": { "name": "Techjays" },
   "homepage": "https://github.com/Jetrix-TJ/bos-memory-plugin",
@@ -15,7 +15,7 @@
     "token": {
       "type": "string",
       "title": "Agent token",
-      "description": "A token starting bosm_, made on the console's Connections page (choose Claude Code). Kept in your system keychain.",
+      "description": "A token starting bosm_, made on the console's Connections page (choose Claude Code). Kept in your system keychain, and in a copy only you can read in ~/.bos-memory for the slash commands.",
       "required": true,
       "sensitive": true
     }
