@@ -1,0 +1,709 @@
+#!/usr/bin/env python3
+"""BOS Memory for Claude Code: the plugin's hooks and slash commands run this.
+
+Hooks (never by hand):
+    bosm-capture context   SessionStart: print what memory knows, as additionalContext
+    bosm-capture prompt    UserPromptSubmit: keep the prompt until the reply arrives
+    bosm-capture turn      Stop: queue the prompt and the reply as one turn, send it
+    bosm-capture flush     PreCompact: send whatever is queued
+    bosm-capture end       SessionEnd: queue "session over", send it
+    bosm-capture upload    send the queue (started in the background by the others)
+
+Commands (also /bos-memory:status, :doctor, :pause, :context):
+    bosm-capture status [--json]   the connection, capture and what is queued here
+    bosm-capture doctor            check the setup and say how to fix what is wrong
+    bosm-capture pause 1h|30m|2d|1w|resume|off|on
+    bosm-capture show-context      what memory knows about the repository in this folder
+    bosm-capture version
+
+The server address and token come from the plugin's settings (asked for when it is enabled,
+the token kept in the system keychain), or BOSM_URL and BOSM_TOKEN. Standard library only.
+Secrets are stripped and pasted text is left out before anything is written or sent. Turns wait
+in ~/.bos-memory/spool until the server takes them, so nothing is lost offline. It never fails a
+hook: any problem goes to ~/.bos-memory/capture.log and the hook exits 0.
+
+Off for a turn: start the prompt with #nocapture. Off entirely: /bos-memory:pause off, the switch
+in the console, or BOSM_CAPTURE=off. Folders and repositories never captured: the console's list,
+or "excludes" in ~/.bos-memory/config.json.
+"""
+
+import contextlib
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import traceback
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+CLIENT = "claude-code"
+VERSION = "1.1.2"
+HOME = os.path.expanduser(os.environ.get("BOSM_CAPTURE_HOME") or "~/.bos-memory")
+SPOOL = os.path.join(HOME, "spool")
+STATE = os.path.join(HOME, "state")
+MAX_SPOOL_BYTES = 50 * 1024 * 1024
+SETTINGS_TTL = 600  # seconds the server's settings are trusted before asking again
+BATCH = 50
+
+# The same patterns as the server (bos_memory/capture/secrets.py); a test keeps them equal.
+PATTERNS = [
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
+    re.compile(r"\bbosm_[A-Za-z0-9_\-]{16,}"),
+    re.compile(r"\b(?:sk|pk|rk)-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_\-]{16,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9\-]{10,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_\-]{30,}"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-.=]{16,}"),
+    re.compile(r"(?i)://[^\s/:@]+:[^\s/@]+@"),
+    re.compile(r"(?im)^\s*(?:export\s+)?[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD)"
+               r"[A-Z0-9_]*\s*[=:]\s*(?!\[redacted\])\S+"),
+    re.compile(r"(?i)\b(?:password|passwd|api[_-]?key|secret|token)\s*[=:]\s*['\"]?"
+               r"(?!\[redacted\])[^\s'\"]{6,}"),
+]
+MASK = "[redacted]"
+PASTED = re.compile(r"<pasted_content\b[^>]*>.*?</pasted_content>", re.S | re.I)
+PR_URL = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
+NOCAPTURE = "#nocapture"
+
+
+# Small helpers --------------------------------------------------------------------------------
+
+def log(message: str) -> None:
+    with contextlib.suppress(OSError):
+        os.makedirs(HOME, exist_ok=True)
+        with open(os.path.join(HOME, "capture.log"), "a", encoding="utf-8") as f:
+            f.write(f"{now()} {message}\n")
+
+
+def debug(message: str) -> None:
+    """With BOSM_CAPTURE_DEBUG=1, every hook and upload is logged too."""
+    if os.environ.get("BOSM_CAPTURE_DEBUG") not in (None, "", "0"):
+        log(message)
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def safe(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:120] or "unknown"
+
+
+def read_json(path: str, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path: str, value) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(value, f)
+    os.replace(tmp, path)
+
+
+def redact(text: str) -> tuple:
+    found = 0
+    for pattern in PATTERNS:
+        text, n = pattern.subn(MASK, text)
+        found += n
+    return text, found
+
+
+def clean(text: str) -> tuple:
+    """Pasted material left out (someone else wrote it), then secrets stripped."""
+    text = PASTED.sub(lambda m: f"[pasted text, {len(m.group(0))} characters, left out]",
+                      text or "")
+    return redact(text)
+
+
+def config() -> dict:
+    return read_json(os.path.join(HOME, "config.json"), {}) or {}
+
+
+CREDENTIALS = "credentials.json"
+
+
+def remember_credentials() -> None:
+    """Hooks get the plugin's settings in CLAUDE_PLUGIN_OPTION_*; slash commands may not. Keep
+    a copy only this user can read, so the commands reach the same server as the hooks."""
+    url = os.environ.get("CLAUDE_PLUGIN_OPTION_URL") or ""
+    token = os.environ.get("CLAUDE_PLUGIN_OPTION_TOKEN") or ""
+    if not (url and token):
+        return
+    path = os.path.join(HOME, CREDENTIALS)
+    if read_json(path, {}) == {"url": url, "token": token}:
+        return
+    os.makedirs(HOME, exist_ok=True)
+    fd = os.open(path + ".tmp", os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"url": url, "token": token}, f)
+    os.replace(path + ".tmp", path)
+
+
+def server() -> tuple:
+    """(url without /mcp, token): BOSM_URL / BOSM_TOKEN, the plugin's settings, the copy the
+    hooks keep, or config.json, in that order."""
+    saved = read_json(os.path.join(HOME, CREDENTIALS), {}) or {}
+    local = config()
+    url = (os.environ.get("BOSM_URL") or os.environ.get("CLAUDE_PLUGIN_OPTION_URL")
+           or saved.get("url") or local.get("url") or "").strip().rstrip("/")
+    token = (os.environ.get("BOSM_TOKEN") or os.environ.get("CLAUDE_PLUGIN_OPTION_TOKEN")
+             or saved.get("token") or local.get("token") or "").strip()
+    if url.endswith("/mcp"):
+        url = url[:-4]
+    return url, token
+
+
+class NotSetUp(RuntimeError):
+    pass
+
+
+def request(method: str, path: str, body=None, timeout: float = 10.0):
+    url, token = server()
+    if not url or not token:
+        raise NotSetUp("The server address or token is not set")
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url + path, data=data, method=method, headers={
+        "Authorization": f"Bearer {token}", "Content-Type": "application/json",
+        "User-Agent": f"bosm-capture/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, json.loads(r.read() or b"{}")
+
+
+# Settings: the person's switch, pause and excludes ----------------------------------------------
+
+def cached_settings() -> dict:
+    return read_json(os.path.join(STATE, "settings.json"), {}) or {}
+
+
+def remember_settings(settings) -> None:
+    if isinstance(settings, dict) and "capture" in settings:
+        write_json(os.path.join(STATE, "settings.json"), settings | {"fetched_at": time.time()})
+
+
+def fresh_settings() -> dict:
+    cached = cached_settings()
+    if time.time() - cached.get("fetched_at", 0) < SETTINGS_TTL:
+        return cached
+    try:
+        _, got = request("GET", "/capture/settings", timeout=5)
+        remember_settings(got)
+        return got
+    except Exception as exc:  # offline: the last known settings still apply
+        log(f"settings: {exc}")
+        return cached
+
+
+def excluded(excludes, cwd, repo) -> bool:
+    for pattern in excludes or []:
+        p = str(pattern).rstrip("/")
+        if repo and fnmatch.fnmatchcase(repo.lower(), p.lower()):
+            return True
+        if cwd and (fnmatch.fnmatchcase(cwd, p) or fnmatch.fnmatchcase(cwd, p + "/*")
+                    or cwd == p or cwd.startswith(p + "/")):
+            return True
+    return False
+
+
+def allowed(settings: dict, cwd, repo) -> bool:
+    """Whether a turn from here may leave the machine."""
+    if (os.environ.get("BOSM_CAPTURE") or "").lower() in ("off", "0", "false", "no"):
+        return False
+    local = config()
+    if local.get("capture") is False:
+        return False
+    if settings.get("capture") is False:
+        if not settings.get("server", True) or not settings.get("enabled", True):
+            return False
+        # Paused: until it runs out, even before the settings are fetched again.
+        try:
+            until = datetime.fromisoformat(str(settings.get("paused_until")))
+        except ValueError:
+            return False
+        if until > datetime.now(timezone.utc):
+            return False
+    return not excluded(list(local.get("excludes") or []) + list(settings.get("excludes") or []),
+                        cwd, repo)
+
+
+# Where the session runs ------------------------------------------------------------------------
+
+def git(cwd, *args) -> str:
+    try:
+        out = subprocess.run(["git", *args], cwd=cwd or None, capture_output=True, text=True,
+                             timeout=2)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def repo_of(remote: str) -> str:
+    m = re.search(r"[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$", remote or "")
+    return m.group(1) if m else ""
+
+
+def place(session_id: str, cwd) -> dict:
+    """cwd, repo and branch of the session, worked out once and kept."""
+    path = os.path.join(STATE, f"{safe(session_id)}.where.json")
+    known = read_json(path)
+    if known and known.get("cwd") == cwd:
+        return known
+    where = {"cwd": cwd, "repo": repo_of(git(cwd, "remote", "get-url", "origin")) or None,
+             "branch": git(cwd, "rev-parse", "--abbrev-ref", "HEAD") or None}
+    with contextlib.suppress(OSError):
+        write_json(path, where)
+    return where
+
+
+# The queue -------------------------------------------------------------------------------------
+
+def queue(event: dict) -> None:
+    os.makedirs(SPOOL, exist_ok=True)
+    total = sum(os.path.getsize(os.path.join(SPOOL, f)) for f in os.listdir(SPOOL))
+    if total > MAX_SPOOL_BYTES:  # long offline: drop the oldest file
+        oldest = min(os.listdir(SPOOL), key=lambda f: os.path.getmtime(os.path.join(SPOOL, f)))
+        os.remove(os.path.join(SPOOL, oldest))
+        log(f"spool over 50 MB: dropped {oldest}")
+    path = os.path.join(SPOOL, f"{safe(event['session']['id'])}.jsonl")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event) + "\n")
+
+
+def send_soon() -> None:
+    """Upload now in a cloud session (the container may not outlive a background process),
+    briefly; else in a detached process, so the hook returns at once. The hooks run in the
+    foreground on purpose: Claude Code cancels a background ("async") hook when the session
+    ends, which would lose the last turn."""
+    if os.environ.get("CLAUDE_CODE_REMOTE") == "true":
+        upload(deadline=time.time() + 3)
+        return
+    try:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "upload"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except OSError as exc:
+        log(f"could not start the uploader: {exc}")
+
+
+def _lock():
+    os.makedirs(HOME, exist_ok=True)
+    path = os.path.join(HOME, "upload.lock")
+    with contextlib.suppress(OSError):
+        if time.time() - os.path.getmtime(path) > 120:  # a crashed uploader's leftover
+            os.remove(path)
+    try:
+        return os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return None
+
+
+def _send_file(path: str, settings: dict, deadline: float) -> tuple:
+    """Send one queue file. It is moved aside first, so a hook appending meanwhile writes to a
+    fresh file instead of one about to be removed; what could not be sent is put back.
+    Returns (sent, dropped, stuck)."""
+    work = path if path.endswith(".sending") else f"{path}.{os.getpid()}.sending"
+    if work != path:
+        os.replace(path, work)
+    with open(work, encoding="utf-8") as f:
+        lines = [json.loads(line) for line in f if line.strip()]
+    todo = [e for e in lines if allowed(settings, e["session"].get("cwd"),
+                                          e["session"].get("repo"))]
+    sent, dropped, stuck, keep = 0, len(lines) - len(todo), False, []
+    for start in range(0, len(todo), BATCH):
+        part = todo[start:start + BATCH]
+        if deadline and time.time() > deadline:
+            keep += todo[start:]
+            stuck = True
+            break
+        try:
+            _, out = request("POST", "/capture", {"events": part},
+                             timeout=max(1.0, deadline - time.time()) if deadline else 15)
+            remember_settings(out.get("settings"))
+            debug(f"upload: sent {len(part)}, server said {json.dumps(out)[:300]}")
+            sent += len(part)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (408, 429) or exc.code >= 500:
+                keep += todo[start:]
+                stuck = True
+                break
+            log(f"server refused {len(part)} events: {exc.code} {exc.read()[:300]!r}")
+            dropped += len(part)
+        except Exception as exc:  # offline: try again next time
+            log(f"upload: {exc}")
+            keep += todo[start:]
+            stuck = True
+            break
+    if keep:
+        base = work.split(".jsonl")[0] + ".jsonl"
+        with open(base, "a", encoding="utf-8") as f:
+            f.writelines(json.dumps(e) + "\n" for e in keep)
+    os.remove(work)
+    return sent, dropped, stuck
+
+
+def upload(deadline: float = 0.0) -> dict:
+    """Send every queued event; keep what the server could not take. One uploader at a time;
+    it looks again for turns queued while it ran, so a hook that found it busy loses nothing."""
+    fd = _lock()
+    if fd is None:
+        return {"sent": 0, "busy": True}
+    sent = dropped = 0
+    try:
+        settings = fresh_settings() if os.path.isdir(SPOOL) else {}
+        for _ in range(5):
+            names = sorted((f for f in os.listdir(SPOOL) if ".jsonl" in f),
+                           key=lambda f: os.path.getmtime(os.path.join(SPOOL, f))) \
+                if os.path.isdir(SPOOL) else []
+            if not names:
+                break
+            stuck = False
+            for name in names:
+                n, d, blocked = _send_file(os.path.join(SPOOL, name), settings, deadline)
+                sent, dropped = sent + n, dropped + d
+                stuck = stuck or blocked
+                if blocked:
+                    break
+            if stuck:
+                break
+    finally:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(HOME, "upload.lock"))
+    return {"sent": sent, "dropped": dropped}
+
+
+# Hooks -----------------------------------------------------------------------------------------
+
+def hook_input() -> dict:
+    try:
+        data = json.load(sys.stdin)
+        return data if isinstance(data, dict) else {}
+    except ValueError:
+        return {}
+
+
+def pending_path(session_id: str) -> str:
+    return os.path.join(STATE, f"{safe(session_id)}.prompt.json")
+
+
+def on_prompt(h: dict) -> None:
+    prompt = h.get("prompt") or ""
+    session_id = h.get("session_id") or "unknown"
+    skip = prompt.lstrip().lower().startswith(NOCAPTURE)
+    text, found = ("", 0) if skip else clean(prompt)
+    write_json(pending_path(session_id), {
+        "prompt_id": h.get("prompt_id") or hashlib.sha256(
+            f"{session_id}|{time.time()}|{prompt}".encode()).hexdigest()[:24],
+        "prompt": text, "redacted": found, "skip": skip, "at": now()})
+
+
+def last_text(transcript_path, role: str) -> str:
+    """The last text the person (role "user") or Claude ("assistant") wrote, from the
+    transcript: for a prompt whose hook did not run, or a reply whose Stop hook did not."""
+    try:
+        with open(transcript_path, encoding="utf-8") as f:
+            lines = f.readlines()[-400:]
+    except (OSError, TypeError):
+        return ""
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        message = entry.get("message") or {}
+        if entry.get("type") != role or message.get("role") != role:
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        texts = [c.get("text", "") for c in content or [] if isinstance(c, dict)
+                 and c.get("type") == "text"]
+        if texts:
+            return "\n".join(texts)
+    return ""
+
+
+def touched(reply: str) -> list:
+    seen, out = set(), []
+    for repo, number in PR_URL.findall(reply or ""):
+        key = f"{repo}#{number}"
+        if key not in seen:
+            seen.add(key)
+            out.append({"system": "github", "id": key, "kind": "pull_request"})
+    return out[:20]
+
+
+def on_turn(h: dict, send: bool = True) -> None:
+    session_id = h.get("session_id") or "unknown"
+    pending = read_json(pending_path(session_id)) or {}
+    with contextlib.suppress(OSError):
+        os.remove(pending_path(session_id))
+    if pending.get("skip"):
+        return
+    prompt, found = pending.get("prompt"), pending.get("redacted", 0)
+    if prompt is None:
+        raw = last_text(h.get("transcript_path"), "user")
+        if raw.lstrip().lower().startswith(NOCAPTURE):
+            return
+        prompt, found = clean(raw)
+    reply, more = clean(h.get("last_assistant_message") or "")
+    if not (prompt.strip() or reply.strip()):
+        return
+    where = place(session_id, h.get("cwd"))
+    if not allowed(cached_settings(), where["cwd"], where["repo"]):
+        return
+    prompt_id = pending.get("prompt_id") or hashlib.sha256(
+        f"{session_id}|{prompt}|{reply}".encode()).hexdigest()[:24]
+    queue({"v": 1, "client": CLIENT, "client_version": VERSION, "kind": "turn",
+           "prompt_id": prompt_id,
+           "session": {"id": session_id, **where}, "at": pending.get("at") or now(),
+           "prompt": prompt, "reply": reply, "touched": touched(reply),
+           "redacted": found + more})
+    if send:
+        send_soon()
+
+
+def on_end(h: dict) -> None:
+    session_id = h.get("session_id") or "unknown"
+    # A prompt still waiting means its Stop hook never ran (the session was cut short):
+    # take the reply from the transcript so the last turn is not lost.
+    if os.path.exists(pending_path(session_id)):
+        reply = last_text(h.get("transcript_path"), "assistant")
+        if reply:
+            on_turn({**h, "last_assistant_message": reply}, send=False)
+    where = place(session_id, h.get("cwd"))
+    if allowed(cached_settings(), where["cwd"], where["repo"]):
+        queue({"v": 1, "client": CLIENT, "client_version": VERSION, "kind": "end", "at": now(),
+               "session": {"id": session_id, **where}})
+    for suffix in (".prompt.json", ".where.json"):
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(STATE, safe(session_id) + suffix))
+    send_soon()
+
+
+SETUP = ("BOS Memory is installed but not set up: its server address or token is missing."
+         " Tell the person to run /plugin, open bos-memory and enter both (the console's"
+         " Connections page gives them), then restart the session.")
+
+
+def on_context(h: dict) -> None:
+    session_id = h.get("session_id") or "unknown"
+    where = place(session_id, h.get("cwd"))
+    note = ""
+    try:
+        _, out = request("POST", "/capture/context",
+                         {**where, "title": h.get("session_title")}, timeout=6)
+    except NotSetUp:
+        out, note = {}, SETUP
+    except urllib.error.HTTPError as exc:
+        out = {}
+        if exc.code in (401, 403):
+            note = ("BOS Memory refused this plugin's token (revoked, or without write access)."
+                    " Tell the person to make a new one on the console's Connections page"
+                    " and enter it with /plugin. Memory tools will fail until then.")
+        log(f"context: {exc}")
+    except Exception as exc:  # offline: the session starts without memory, quietly
+        log(f"context: {exc}")
+        out = {}
+    remember_settings(out.get("settings"))
+    text = out.get("text") or note
+    if text:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                                 "additionalContext": text[:9500]}}))
+    if os.path.isdir(SPOOL) and os.listdir(SPOOL):  # anything left from last time
+        send_soon()
+
+
+def queued() -> int:
+    total = 0
+    if os.path.isdir(SPOOL):
+        for f in os.listdir(SPOOL):
+            with open(os.path.join(SPOOL, f), encoding="utf-8") as fh:
+                total += sum(1 for line in fh if line.strip())
+    return total
+
+
+def describe(settings: dict) -> str:
+    if (os.environ.get("BOSM_CAPTURE") or "").lower() in ("off", "0", "false", "no") \
+            or config().get("capture") is False:
+        return "off on this machine (BOSM_CAPTURE=off or config.json)"
+    if not settings:
+        return "unknown (the server could not be reached)"
+    if not settings.get("server", True):
+        return "not available on this server (it needs a Gemini key)"
+    if not settings.get("enabled", True):
+        return "off (turned off in the console or with /bos-memory:pause off)"
+    if settings.get("paused_until") and not settings.get("capture"):
+        return f"paused until {settings['paused_until'][:16].replace('T', ' ')} UTC"
+    return "on"
+
+
+def status(argv) -> None:
+    url, token = server()
+    settings = fresh_settings() if url and token else {}
+    info = {"version": VERSION, "url": url or None, "token": bool(token), "home": HOME,
+            "capture": describe(settings), "excludes": list(settings.get("excludes") or [])
+            + list(config().get("excludes") or []), "queued": queued()}
+    if "--json" in argv:
+        print(json.dumps(info, indent=2))
+        return
+    print(f"BOS Memory plugin {VERSION}")
+    print(f"Server:   {url or 'not set (run /plugin and configure bos-memory)'}")
+    print(f"Token:    {'set' if token else 'not set'}")
+    print(f"Capture:  {info['capture']}")
+    print(f"Never captured: {', '.join(info['excludes']) or 'nothing excluded'}")
+    print(f"Waiting on this machine: {info['queued']} "
+          f"{'turn' if info['queued'] == 1 else 'turns'}")
+    print(f"Local data: {HOME}")
+
+
+def doctor() -> None:
+    """Each check with a fix for what fails."""
+    checks = []
+
+    def check(ok, label, fix=""):
+        checks.append(ok)
+        hint = "" if ok or not fix else f"\n      fix: {fix}"
+        print(("ok    " if ok else "FAIL  ") + label + hint)
+
+    check(sys.version_info >= (3, 9), f"Python {sys.version.split()[0]}",
+          "install Python 3.9 or later as python3")
+    check(bool(git(None, "--version")), "git is available", "install git")
+    url, token = server()
+    check(bool(url), f"server address: {url or 'missing'}",
+          "run /plugin, open bos-memory and enter the address shown on Connections")
+    check(bool(token), "token: " + ("set" if token else "missing"),
+          "make a token on the console's Connections page and enter it with /plugin")
+    if url:
+        try:
+            with urllib.request.urlopen(url + "/healthz", timeout=5) as r:
+                check(r.status == 200, f"server reachable ({url})")
+        except Exception as exc:
+            check(False, f"server reachable ({exc})", "check the address and your network")
+    if url and token:
+        try:
+            _, got = request("GET", "/capture/settings", timeout=5)
+            remember_settings(got)
+            check(True, "token accepted")
+            check(got.get("server", True), "capture available on the server",
+                  "the server needs BOSM_GEMINI_API_KEY; ask whoever runs it")
+            check(bool(got.get("capture")), f"capture: {describe(got)}",
+                  "/bos-memory:pause resume, or turn it on in the console")
+        except urllib.error.HTTPError as exc:
+            check(False, f"token accepted (HTTP {exc.code})",
+                  "the token was revoked or lacks write access: make a new one")
+        except Exception as exc:
+            check(False, f"token check ({exc})", "check the address and your network")
+    waiting = queued()
+    check(waiting < 50, f"{waiting} turns waiting on this machine",
+          "they are sent when the server can be reached; see the log below")
+    try:
+        os.makedirs(HOME, exist_ok=True)
+        probe = os.path.join(HOME, ".probe")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        check(True, f"local data folder writable ({HOME})")
+    except OSError as exc:
+        check(False, f"local data folder writable ({exc})", "fix the folder's permissions")
+    try:
+        with open(os.path.join(HOME, "capture.log"), encoding="utf-8") as f:
+            tail = f.readlines()[-3:]
+        if tail:
+            print("Last log lines:\n  " + "  ".join(tail).rstrip())
+    except OSError:
+        pass
+    print("All good." if all(checks) else f"{checks.count(False)} problem(s) found.")
+
+
+DURATION = re.compile(r"^(\d{1,4})\s*(m|min|mins|h|hr|hrs|hour|hours|d|day|days|w|wk|week|weeks)$")
+
+
+def pause(argv) -> None:
+    arg = " ".join(argv).strip().lower() or "1h"
+    if arg in ("resume", "on", "start"):
+        body = {"pause_minutes": 0} | ({"enabled": True} if arg == "on" else {})
+    elif arg in ("off", "stop"):
+        body = {"enabled": False}
+    else:
+        m = DURATION.match(arg)
+        if not m:
+            print("Say how long: 30m, 1h, 1d or 1w; or resume, off, on.")
+            return
+        unit = m.group(2)[0]
+        body = {"pause_minutes": int(m.group(1)) * {"m": 1, "h": 60, "d": 1440, "w": 10080}[unit]}
+        body["pause_minutes"] = min(body["pause_minutes"], 10080)
+    try:
+        _, got = request("POST", "/capture/settings", body, timeout=8)
+    except NotSetUp:
+        print("Not set up: run /plugin, open bos-memory and enter the address and token.")
+        return
+    except Exception as exc:
+        print(f"Could not reach BOS Memory: {exc}")
+        return
+    remember_settings(got)
+    print(f"Capture is now {describe(got)}.")
+
+
+def show_context() -> None:
+    cwd = os.getcwd()
+    where = place(f"cli-{hashlib.sha256(cwd.encode()).hexdigest()[:12]}", cwd)
+    try:
+        _, out = request("POST", "/capture/context", where, timeout=8)
+    except NotSetUp:
+        print(SETUP)
+        return
+    except Exception as exc:
+        print(f"Could not reach BOS Memory: {exc}")
+        return
+    remember_settings(out.get("settings"))
+    print(out.get("text") or "Nothing came back.")
+
+
+HOOKS = {"context": on_context, "prompt": on_prompt, "turn": on_turn, "end": on_end}
+
+
+def main(argv) -> int:
+    command, rest = (argv[1] if len(argv) > 1 else "status"), argv[2:]
+    try:
+        if command in HOOKS or command in ("upload", "flush"):
+            remember_credentials()
+        if command == "status":
+            status(rest)
+        elif command == "doctor":
+            doctor()
+        elif command == "pause":
+            pause(rest)
+        elif command == "show-context":
+            show_context()
+        elif command == "version":
+            print(VERSION)
+        elif command == "upload":
+            upload()
+        elif command == "flush":
+            send_soon()
+        elif command in HOOKS:
+            h = hook_input()
+            debug(f"{command}: {', '.join(sorted(h))}")
+            HOOKS[command](h)
+        else:
+            print(f"Unknown command {command!r}; try status, doctor, pause, show-context.")
+    except Exception:  # a hook never fails Claude Code
+        log(f"{command}: {traceback.format_exc(limit=3)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
