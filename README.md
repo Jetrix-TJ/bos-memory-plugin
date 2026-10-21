@@ -9,7 +9,7 @@ session, automatic capture of the decisions, commitments and rules in your sessi
 ## Install
 
 You need your BOS Memory server's address and an agent token. In the BOS Memory console, open
-**Connections** and choose **Claude Code**: the page shows this command with both filled in.
+**Connections** and choose **Claude**: the page shows this command with both filled in.
 
 ```
 claude plugin install bos-memory --marketplace Jetrix-TJ/bos-memory-plugin \
@@ -22,7 +22,7 @@ and enter the address and token when asked.
 
 Then start a new session and run `/bos-memory:doctor`.
 
-Needs `python3` (3.9 or later) and `git`: macOS, Linux and WSL.
+Needs `python3` (3.9 or later) and `git`: macOS, Linux, WSL, and Windows when `python3` runs in a terminal.
 
 Everything else (commands, privacy, uninstalling) is in
 [plugins/claude-code/README.md](plugins/claude-code/README.md).

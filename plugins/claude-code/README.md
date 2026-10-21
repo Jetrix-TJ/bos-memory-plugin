@@ -14,7 +14,7 @@ One plugin for everything BOS Memory does in Claude Code:
 ## Install
 
 You need the server's address and an agent token: on the console's **Connections** page,
-choose **Claude Code**. The page shows these commands with both filled in.
+choose **Claude**. The page shows these commands with both filled in.
 
 In a terminal (Claude Code 2.1.292 or later):
 
@@ -32,7 +32,7 @@ Then start a new session and run `/bos-memory:doctor`.
 If you added BOS Memory before with `claude mcp add`, remove that entry
 (`claude mcp remove bos-memory`): the plugin brings the same server.
 
-Needs `python3` (3.9 or later) and `git` on the PATH: macOS, Linux and WSL.
+Needs `python3` (3.9 or later) and `git` on the PATH: macOS, Linux, WSL, and Windows when `python3` runs in a terminal (not the Microsoft Store stub).
 
 ## Hooks
 
