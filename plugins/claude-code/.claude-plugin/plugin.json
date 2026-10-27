@@ -1,6 +1,6 @@
 {
   "name": "bos-memory",
-  "version": "1.1.4",
+  "version": "1.1.6",
   "description": "BOS Memory for Claude Code: the memory tools, what memory knows at the start of each session, and automatic capture of decisions, commitments and rules from your sessions.",
   "author": { "name": "Techjays" },
   "homepage": "https://github.com/Jetrix-TJ/bos-memory-plugin",

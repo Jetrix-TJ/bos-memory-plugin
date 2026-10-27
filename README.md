@@ -20,7 +20,8 @@ Claude Code 2.1.292 or later. On older versions, inside Claude Code:
 `/plugin marketplace add Jetrix-TJ/bos-memory-plugin`, then `/plugin install bos-memory@bos-memory`,
 and enter the address and token when asked.
 
-Then start a new session and run `/bos-memory:doctor`.
+Then start a new session and run `/bos-memory:doctor`. Update later with
+`claude plugin update bos-memory@bos-memory`.
 
 Needs `python3` (3.9 or later) and `git`: macOS, Linux, WSL, and Windows when `python3` runs in a terminal.
 

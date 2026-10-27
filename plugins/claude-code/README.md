@@ -69,7 +69,14 @@ Needs `python3` (3.9 or later) and `git` on the PATH: macOS, Linux, WSL, and Win
   only by you, so the slash commands reach the same server.
 - Captured memories are yours only; admins never see them.
 
-Problems go to `~/.bos-memory/capture.log`; a hook never fails your session.
+Problems go to `~/.bos-memory/capture.log`; a hook never fails your session. The folder is
+readable only by you, the log is rotated at 1 MB, and state left by sessions that never ended is
+removed after 7 days. On Windows the uploader runs under `pythonw`, so no window opens.
+
+## Update
+
+`claude plugin update bos-memory@bos-memory`, then restart Claude Code. Your settings and queue
+are kept.
 
 ## Uninstall
 
